@@ -3,6 +3,7 @@ Capture images and combine with weather and position info from drone, storing th
 Functions to retake the same position as in a previous image and take another image.
 """
 import asyncio
+import csv
 import logging
 import math
 import pathlib
@@ -10,7 +11,8 @@ from asyncio import StreamReader, StreamWriter
 from collections.abc import Callable
 import socket
 from queue import Queue, Empty
-
+import subprocess
+import threading
 import numpy as np
 import json
 import datetime
@@ -124,13 +126,15 @@ class ENGELDataMission(Mission):
             "transfer": self.transfer,
             "done": self.done,
             "test-init": self.init_test,
-            "connect-command": self.connect_command,
+            # "connect-command": self.connect_command,
             "connect-data": self.connect_data,
             "test-start": self.start_test,
             "test-command": self.test_command,
             "test-stop": self.stop_test,
             "test-close": self.close_test,
             "test-rates": self.rate_test,
+            "test-log-start": self.open_motion_log,
+            "test-log-stop": self.close_motion_log,
         }
         self.cli_commands.update(mission_cli_commands)
         self.weather_sensor = None
@@ -167,7 +171,85 @@ class ENGELDataMission(Mission):
         self.translation_shift = None
         self.rotation_shift = None
         self.rotation_target = None
+        self.target_flag = 0
+        self.arrived_flag = False
         self._loop = asyncio.get_running_loop()
+        self.motion_log_path: pathlib.Path | None = None
+        self._motion_log_file = None
+        self._motion_log_writer = None
+
+    def _get_motion_log_path(self, filename: str | None = None) -> pathlib.Path:
+        if filename is None:
+            timestamp = datetime.datetime.now(datetime.UTC)
+            filename = f"motion_log_{timestamp.strftime('%Y%m%d_%H%M%S')}.csv"
+        return pathlib.Path(CAPTURE_DIR).joinpath(filename)
+    
+    def get_arrive_flag(self):
+        return self.arrived_flag
+
+    async def _open_motion_log(self, filename: str | None = None) -> None:
+        self.motion_log_path = self._get_motion_log_path(filename)
+        self._motion_log_file = open(self.motion_log_path, "w", newline="", encoding="utf-8")
+        self._motion_log_writer = csv.writer(self._motion_log_file)
+        self._motion_log_writer.writerow(["Time", "PosX", "PosY", "PosZ", "Pitch", "Yaw", "Roll", "PitchCam", "YawCam", "RollCam"])
+        self.logger.info(f"Opened motion log {self.motion_log_path}")
+        await self._write_motion_log_entry() # Write initial entry with nans for position and attitude until we get actual data, but good to have the timestamp of when the log was opened
+
+    async def _close_motion_log(self) -> None:
+        if self._motion_log_file is not None:
+            try:
+                self._motion_log_file.close()
+                self.logger.info(f"Closed motion log {self.motion_log_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to close motion log: {e}")
+                self.logger.debug(repr(e), exc_info=True)
+            finally:
+                self._motion_log_file = None
+                self._motion_log_writer = None
+                self.motion_log_path = None
+
+    async def _write_motion_log_entry(self) -> None:
+        if self._motion_log_writer is None:
+            return
+
+        pos_x = math.nan
+        pos_y = math.nan
+        pos_z = math.nan
+        pitch = math.nan
+        yaw = math.nan
+        roll = math.nan
+        rel_pitch = math.nan
+        rel_yaw = math.nan
+        rel_roll = math.nan
+
+        while self._motion_log_writer is not None:
+             
+            if pos_x == math.nan or pos_y == math.nan or pos_z == math.nan or pitch == math.nan or yaw == math.nan or roll == math.nan or rel_pitch == math.nan or rel_yaw == math.nan or rel_roll == math.nan:
+                await asyncio.sleep(0.005)
+                continue  # Skip logging if any value is NaN, we want to log only when we have valid data
+
+            time_stamp = datetime.datetime.now(datetime.UTC).timestamp()
+
+            if self.drone_name is not None and self.drone_name in self.dm.drones:
+                drone = self.dm.drones[self.drone_name]
+                pos = drone.position_global
+                att = drone.attitude
+                if pos is not None:
+                    pos_x, pos_y, pos_z = pos.tolist()
+                if att is not None:
+                    roll, pitch, yaw = att.tolist()
+
+            if self.gimbal is not None:
+                rel_roll = self.gimbal.roll
+                rel_pitch = self.gimbal.pitch
+                rel_yaw = self.gimbal.yaw
+
+            self._motion_log_writer.writerow([time_stamp, pos_x, pos_y, pos_z, pitch, yaw, roll, rel_pitch, rel_yaw, rel_roll])
+            if self._motion_log_file is not None:
+                self._motion_log_file.flush()
+            # self.logger.debug(f"{' '.join([str(time_stamp), str(pos_x), str(pos_y), str(pos_z), str(pitch), str(yaw), str(roll), str(rel_pitch), str(rel_yaw), str(rel_roll)])}")
+            await asyncio.sleep(0.005)
+            # await asyncio.sleep(1 / self._gimbal_frequency)
 
     async def close(self):
         for button, func in self._added_controller_buttons.items():
@@ -634,21 +716,29 @@ class ENGELDataMission(Mission):
             await asyncio.sleep(1/self._gimbal_frequency)
 
     def correction_callback(self, parsed_message):
-        if parsed_message:
+        if parsed_message :
             try:
+                if self.target_flag == -1:
+                    self.arrived_flag = True
                 rotation = parsed_message["rotation"]  # roll pitch yaw in degrees per second
                 translation = parsed_message["translation"]  # x y z in cm / s
                 rotation_target = parsed_message["target"]
-                self.logger.info(parsed_message)
+                self.target_flag = parsed_message["target_flag"]
+                # self.logger.info(parsed_message)
                 self.translation_shift = translation / 100
                 self.rotation_target = rotation_target
                 self.rotation_shift = rotation
+
+                # Log current drone and gimbal pose for this correction message
+                # self._write_motion_log_entry()
 
                 # Do this here for testing
                 self.logger.info(f"Received message {parsed_message}")
                 _, pitch_rate, yaw_rate = self.rotation_shift
                 gimbal_task = asyncio.run_coroutine_threadsafe(self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate), self._loop)
                 gimbal_awaiter_task = asyncio.run_coroutine_threadsafe(coroutine_awaiter(gimbal_task, self.logger), self._loop)
+                if self.rotation_target == "arrived":
+                    self.logger.info("Position correction target reached!")
             except Exception as e:
                 self.logger.warning("Exception forward position message! See log for details")
                 self.logger.debug(repr(e), exc_info=True)
@@ -667,53 +757,114 @@ class ENGELDataMission(Mission):
             except Exception as e:
                 self.logger.warning("Exception setting gimbal rates!")
                 self.logger.debug(repr(e), exc_info=True)
+    async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
+                        target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
+                        stream: str = "tcp://10.116.88.38:9000", unreal: int = 1, metod: str = "wsl", ssh_user: str ="user",
+                        imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
+                        ):
+        
+        if not ssh_user:
+            ssh_user = None
 
-    async def init_test(self, ip: str = "127.0.0.1", command_port: int = 9020, data_port: int = 9010):
         self.logger.info("Performing setup for position correction algorithm...")
-        self.correction_algo = PositionCorrectionHandler()
+        self.correction_algo = PositionCorrectionHandler(parent=self)
         self.correction_algo.message_callback = self.correction_callback
-        await self.connect_command(ip, command_port)
+        self.repositioning_task = None
+        self.start_repositioning(ip, ssh_user, binary, target_image, unreal, stream, metod)
+        # await self.connect_command(ip, command_port)
+        await asyncio.sleep(2)  # Wait a bit for the command channel to be ready
         await self.connect_data(ip, data_port)
+        simulation = bool(simulation)
+        if simulation:
+            self.connect_simulation()
         self.logger.info("Setup for position correction test completed.")
 
-    async def connect_command(self, ip: str = "127.0.0.1", port: int = 9020):
-        await self.correction_algo.connect_command_channel(ip, port)
+    def start_repositioning(self, ssh_ip: str|None, ssh_user: str|None, binary: str = "build/ImageMatcher", 
+                                  target_image: str = "controls/imagesGT", unreal: int = 0, 
+                                  stream: str = "tcp://10.116.88.38:9000", metod: str = "wsl",
+                                  ):
+        self.repositioning_task = asyncio.create_task(self.correction_algo.start_repositioning
+                                                      (
+                                                        target_image=target_image, binary_file=binary, 
+                                                        unreal=unreal,stream=stream, method=metod, 
+                                                        ssh_ip=ssh_ip, ssh_user=ssh_user,
+                                                        ))
+
+        # self.correction_algo.start_repositioning(target_image=target_image, binary_file=binary, 
+        #                                                unreal=unreal,stream=stream, method=metod, 
+        #                                                ssh_ip=ssh_ip, ssh_user=ssh_user)
+
+    def connect_simulation(self, ip: str = "10.116.88.38", port: int = 9001):
+        self.correction_algo.connect_sim(ip, port)
 
     async def connect_data(self, ip: str = "127.0.0.1", port: int = 9010):
-        await self.correction_algo.connect_data_channel(ip, port)
-
+        await self.correction_algo.connect_command_channel(ip, port)
+        
     async def start_test(self):
-        await self.correction_algo.start()
+        self.correction_algo.start()
+        if self._motion_log_writer is None:
+            await self._open_motion_log()
 
     async def test_command(self, cmd: str):
         try:
-            await self.correction_algo.send_command(cmd)
+            self.correction_algo.send_command(cmd)
         except Exception as e:
             self.logger.warning(f"Couldn't send command {cmd} due to an exception: {repr(e)}")
             self.logger.debug(repr(e), exc_info=True)
 
     async def stop_test(self):
         await self.correction_algo.stop()
+        if self._motion_log_writer is not None:
+            await self._close_motion_log()
+        if self.repositioning_task:
+            self.repositioning_task.cancel()
+            try:
+                await self.repositioning_task
+            except asyncio.CancelledError:
+                pass
 
     async def close_test(self):
         if self.correction_algo is not None:
             await self.correction_algo.stop()
-            await self.correction_algo.close()
+            self.correction_algo.close()
             self.correction_algo = None
+        await self._close_motion_log()
 
+    async def open_motion_log(self, filename: str = None):
+        if self._motion_log_writer is not None:
+            self.logger.debug("Motion log already open!")
+            return
+        await self._open_motion_log(filename)
+    
+    async def close_motion_log(self):
+        if self._motion_log_writer is None:
+            self.logger.debug("Motion log already closed!")
+            return
+        await self._close_motion_log()
 
 def _roll_pitch_compensation(gimbal_yaw, drone_roll, drone_pitch):
     return math.sin(gimbal_yaw)*drone_roll + math.cos(gimbal_yaw) * drone_pitch
 
 
 class PositionCorrectionHandler:
-    def __init__(self):
+    def __init__(self, parent):
+        self.parent = parent
         # Initialise the channel classes
+        self.wsl_home_dir = "/home/user/drone_repositioning"
+        self.binary_file =  "build/ImageMatcher"
+        # self.wsl_image_folder = ""
+        self.binary_path = None
+        self.wsl_target_image = None
+        self.remote_user = None # "riker"
+        self.remote_host = None # "10.116.88.38"
+        self.message_ = None
+        self.start_receiving = False
+        # self.image_file = ""
         self.running = False
-        self.data_handler = DataChannel()
         self.command_handler = CommandChannel()
         self.message_callback = None
         self.handler_task = None
+        self.sim_task = None
         self.logger = logging.getLogger("Manager.CorrectionAlgorithm")
         self.loop = asyncio.get_running_loop()
         self.valid_commands = ["start", "stop", "pause", "resume", "rotation_only", "translation_only", "status", "quit"]
@@ -721,151 +872,241 @@ class PositionCorrectionHandler:
     async def connect_command_channel(self, ip: str = "127.0.0.1", port: int = 9020):
         try:
             await self.command_handler.connect(ip, port)
-            self.logger.info("Connected command channel")
+            # self.logger.info("Connected command channel")
         except ConnectionRefusedError as e:
             self.logger.warning(f"Couldn't connect to command channel: Connection refused! {repr(e)}")
             raise
 
-    async def connect_data_channel(self, ip: str = "127.0.0.1", port: int = 9010):
+    def connect_sim(self, ip: str = "127.0.0.1", port: int = 9020):
+        self.command_handler.set_sim(ip=ip, port=port)
+
+    async def _handle_packet_sim(self):
         try:
-            await self.data_handler.connect(ip, port)
-            self.logger.info("Connected data channel")
-        except ConnectionRefusedError as e:
-            self.logger.warning(f"Couldn't connect to command channel: Connection refused! {repr(e)}")
-            raise
+            while self.start_receiving and not self.command_handler.arrived_at_target:
+                values = self.message_.split(',')
+                self.command_handler.set_location_simulation(values)
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            self.logger.warning(f"Exception in simulation packet handler: {repr(e)}")
+            self.logger.debug(repr(e), exc_info=True)
 
-    async def send_command(self, cmd):
+    def send_command(self, cmd):
         assert cmd in self.valid_commands, f"Invalid command {cmd}, must be one of {self.valid_commands}"
+        self.command_handler.send_command(cmd)
         self.logger.info(f"Sending command {cmd} to correction algo")
-        await self.command_handler.send_command(cmd)
 
-    async def start(self):
+    def start(self):
         # Start processing all the stuff
         self.logger.info("Starting correction algorithm...")
-        self.data_handler.processing = True
+        self.command_handler.processing = True
         self.running = True
         self.handler_task = self.loop.run_in_executor(None, self._data_thread)
-        await self.send_command("start")
+        self.send_command("start")
+
+    async def start_repositioning(self, target_image: str, binary_file: str, unreal:int, 
+                                  stream: str, method:str, ssh_ip: str|None, ssh_user: str|None):
+        # self.remote_user = ssh_user
+        # self.remote_host = ssh_ip
+        # self.image_file = target_image
+        self.binary_path = f"{self.wsl_home_dir}/{binary_file}"
+        self.wsl_target_image = f"{self.wsl_home_dir}/{target_image}"
+        tag = "0" if unreal == 0 else "1"
+        # stream = "tcp://10.116.88.38:9000"
+        self.stream = stream
+        remote_command = [self.binary_path, 
+                            "--imgWidth", "1920", 
+                            "--imgHeight", "1080", 
+                            "--unreal", tag, 
+                            "--target", self.wsl_target_image, 
+                            "--rtsp", self.stream
+                        ]
+        if method == "ssh" and ssh_ip is not None and ssh_user is not None:
+            ssh_cmd = ["ssh", f"{ssh_user}@{ssh_ip}"] + remote_command
+        elif method == "wsl":
+            ssh_cmd = ["wsl"] + remote_command
+        else:
+            self.logger.warning("Can't start repositioning system")
+        # proc = subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL ) #capture_output=True,text=True) #
+        proc = await asyncio.create_subprocess_exec( *ssh_cmd,
+                                                    stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.PIPE,
+                                                    stdin=asyncio.subprocess.DEVNULL  # stops it from grabbing terminal input
+                                                    )
+        # self.logger.info(proc.stdout)
+        # self.logger.info(proc.stderr)
+        # await asyncio.sleep(1)
 
     async def stop(self):
+        self.logger.info("Closing correction algorithm...")
+        if self.command_handler.simulation:
+            self.command_handler.set_location_simulation()
+        else:
+            self.loop.call_soon_threadsafe(self.message_callback, self.command_handler.result_last)
         self.logger.info("Stopping correction algorithm...")
-        self.data_handler.processing = False
+        self.command_handler.processing = False
         try:
-            await self.send_command("stop")
+            self.send_command("stop")
         except ConnectionAbortedError:
             self.logger.info("Couldn't send stop command: Connection aborted")
+        self.command_handler.close()
+        self.close()
 
     def _data_thread(self):
-        while self.running:
+        while self.running: # and not self.command_handler.arrived_at_target:
             try:
-                message = self.data_handler.get_from_queue()
+                message = self.command_handler.get_from_queue()
                 if message:
-                    if self.message_callback is not None:
-                        data = self.data_handler.parse_motion_command(message)
+                    if self.command_handler.simulation:
+                        # Clean the message (remove newlines and extra whitespace)
+                        self.message_ = message.strip()
+                        self.logger.info(f"Got a message from the queue: {message}")
+                        if not self.start_receiving:
+                            self.start_receiving = True
+                            self.sim_task = asyncio.run_coroutine_threadsafe(self._handle_packet_sim(), self.loop)
+                    elif self.message_callback is not None:
+                        self.logger.info(f"Got a message from the queue: {message}")
+                        data = self.command_handler.parse_motion_command(message)
                         self.loop.call_soon_threadsafe(self.message_callback, data)
+                if self.parent.arrived_flag:
+                    # self.loop.call_soon_threadsafe(self.close)
+                    self.close()
+                    
+                    #self.running = False
+                    
             except Exception as e:
                 self.logger.warning(repr(e), exc_info=True)
+        
 
-    async def close(self):
-        self.logger.info("Closing correction algorithm...")
+    def close(self):
+        # self.logger.info("Closing correction algorithm...")
+        # self.loop.call_soon_threadsafe(self.message_callback, self.command_handler.result_last)
         self.running = False
-        self.command_handler.close()
+        self.start_receiving = False
         if self.handler_task is not None:
             self.handler_task.cancel()
-        self.data_handler.close()
+        if self.sim_task is not None:
+            self.sim_task.cancel()
+        # self.command_handler.close()
         self.logger.info("Closed correction algorithm")
 
 
-class CommandChannel:
+class UDPCommandChannel(asyncio.DatagramProtocol):
+    def __init__(self, on_message):
+        self.transport = None
+        self.on_message = on_message
+        
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        self.on_message(data, addr)
+
+    def error_received(self, exc):
+        print(f"UDP error: {exc}")
+
+    def send(self, data, addr):
+        self.transport.sendto(data, addr)
+
+class CommandChannel():
     def __init__(self):
+        self.logger = logging.getLogger("Manager.CorrectionAlgorithm")
+        self.message_queue = Queue(maxsize=1)
+        self.transport: asyncio.DatagramTransport | None = None
+        self.protocol: UDPCommandChannel | None = None
+        self.simulation = False
         self.ip = None
         self.port = None
-        self.conn: tuple[StreamReader, StreamWriter] | None = None
-        self.logger = logging.getLogger("Manager.CorrectionAlgorithm")
-
-    async def connect(self, ip, port) -> None:
-        self.ip = ip
-        self.port = port
-        if self.conn:
-            return
-        self.conn = await asyncio.open_connection(ip, port, family=socket.AF_INET)
-        self.logger.info(f"[tcp] connected to {self.ip}:{self.port}")
-
-    def close(self) -> None:
-        if self.conn:
-            try:
-                self.conn[1].close()
-            except Exception:
-                pass
-            self.conn = None
-
-    async def send_command(self, cmd: str) -> None:
-        msg = (cmd + "\n").encode("utf-8")
-        if not self.conn:
-            self.logger.warning("Can't send command, not connected!")
-        else:
-            self.conn[1].write(msg)
-            await self.conn[1].drain()
-
-
-class DataChannel:
-    def __init__(self):
-        self.ip = None
-        self.port = None
-        self.conn: tuple[StreamReader, StreamWriter] | None = None
-        self.logger = logging.getLogger("Manager.CorrectionAlgorithm")
-        self.message_queue = Queue()
-        self.running = False  # Listening to incoming messages
-        self.processing = False  # Passing incoming messages onward
-        self.data_task = None
-
-    async def connect(self, ip, port) -> None:
-        self.ip = ip
-        self.port = port
-        if self.conn:
-            return
-        self.conn = await asyncio.open_connection(ip, port, family=socket.AF_INET)
-        self.running = True
-        self.logger.info(f"[tcp] connected to {self.ip}:{self.port}")
-        self.data_task = asyncio.create_task(self._receive_msg())
-
-    def close(self) -> None:
+        self.ip_sim = None
+        self.port_sim = None
+        self.processing = False
+        self.arrived_at_target = False
+        self.result_last = {
+                'rotation': np.zeros(3),
+                'translation': np.zeros(3),
+                'target': "gimbal",
+                'target_flag': True
+            }
+        # self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    async def connect(self, ip: str = "127.0.0.1", port: int = 9020):
         try:
-            if self.data_task is not None:
-                self.data_task.cancel()
-            self.running = False
-            self.processing = False
-            if self.conn:
-                try:
-                    self.conn[1].close()
-                except Exception:
-                    pass
-                self.conn = None
-        except Exception as e:
-            self.logger.error(repr(e), exc_info=True)
+            self.ip = ip
+            self.port = port
+            # self.sock.bind((ip, port))
+            loop = asyncio.get_running_loop()
+
+            self.transport, self.protocol = await loop.create_datagram_endpoint(
+                                                        lambda: UDPCommandChannel(on_message=self._handle_packet),
+                                                        local_addr=("0.0.0.0", port),family=socket.AF_INET)
+                                                        # remote_addr=(ip, port))
+            self.logger.info(f"Connected command channel") # to {ip}:{port}")
+            self.start()
+        except ConnectionRefusedError as e:
+            self.logger.warning(f"Couldn't connect to command channel: Connection refused! {repr(e)}")
+            raise
 
     def start(self):
         self.processing = True
+    
+    def close(self) -> None:
+        self.processing = False
+        if self.simulation:
+            self.logger.info("Simulation mode: stopping simulation packet handler")
+            self.simulation = False
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None
+            self.protocol = None
+            self.logger.info("Command channel disconnected")
+    
+    def _handle_packet(self, data, addr):
+        message = data.decode('utf-8')
+        if message and self.processing:
+            # Check if full, remove oldest, then insert
+            if self.message_queue.full():
+                self.message_queue.get_nowait()  # Remove oldest
 
-    async def _receive_msg(self):
-        """Receive messages from a connected client and add them to the queue."""
-        self.logger.info("Listening for messages...")
-        while self.running:
-            try:
-                message = (await self.conn[0].readline()).decode("utf-8")
-                if self.processing and message:
-                    self.logger.info(f"Got a message, current queue size: {self.message_queue.qsize()}")
-                    self.message_queue.put(message)
-                if self.conn[0].at_eof():
-                    break
-            except Exception as e:
-                self.logger.warning("Exception receiving data over data channel!")
-                self.logger.debug(repr(e), exc_info=True)
+            self.message_queue.put(message)
+            # self.logger.info(f"Got a message, current queue size: {self.message_queue.qsize()}")
+            # self.logger.info(f"Got a message, current message: {message}")
+            
+    def set_location_simulation(self, values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], target="drone"):
+        params = {"pitch": float(values[0]), "yaw": float(values[1]), "roll": float(values[2]), "x": float(values[3]), "y": float(values[4]), "z": float(values[5])}
+        target = "gimbal"
+        if int(values[6]) == -1:
+            target = "arrived"
+        if int(values[6]) == 0:
+            target = "drone"
+        data = {"command": "setPose", "target": target, "params": params}
+        message = json.dumps(data)
+        self.send_command(message, sim=True)
+
+    def set_sim(self, ip: str, port: int):
+        self.simulation = True
+        self.ip_sim = ip
+        self.port_sim = port
+        self.logger.info(f"Set simulation IP and port to {ip}:{port}")
+
+    def send_command(self, command: str, sim: bool = False):
+        if self.transport is None:
+            self.logger.warning("Cannot send: command channel not connected")
+            return
+        # self.logger.info(f"Sending: {message} command to {self.ip}:{self.port}")
+        if sim:
+            message = command
+        else:
+            message = command + "\n"
+        data = message.encode('utf-8')
+        if sim and self.ip_sim is not None and self.port_sim is not None:
+            self.transport.sendto(data, (self.ip_sim, self.port_sim))
+            # self.logger.info(f"Sent: {message} to {self.ip_sim}:{self.port_sim}")
+        else:
+            self.transport.sendto(data, (self.ip, self.port))
+            # self.logger.info(f"Sent: {message} to {self.ip}:{self.port}")
 
     def get_from_queue(self):
         """Get and remove the next message from the queue."""
         try:
-            return self.message_queue.get(timeout=1)
+            return self.message_queue.get()
         except Empty:
             return None
         except Exception as e:
@@ -889,6 +1130,7 @@ class DataChannel:
             values = message.split(',')
 
             if len(values) < 7:
+                # self.logger.info(f"Data received from controller: {message}")
                 self.logger.warning(f"Error: Expected at least 7 values, got {len(values)}")
                 return None
 
@@ -900,7 +1142,11 @@ class DataChannel:
 
             # Parse target flag (last value)
             target_flag = int(values[6])
-            target = 'drone' if target_flag == 1 else 'gimbal'
+            target = 'gimbal'
+            if target_flag == 1:
+                target = 'drone'
+            elif target_flag == -1:
+                self.arrived_at_target = True
 
             result = {
                 'rotation': rotation,
