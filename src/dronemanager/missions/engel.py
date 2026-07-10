@@ -172,7 +172,7 @@ class ENGELDataMission(Mission):
         self.rotation_shift = None
         self.rotation_target = None
         self.target_flag = 0
-        self.arrived_flag = False
+        # self.arrived_flag = False
         self._loop = asyncio.get_running_loop()
         self.motion_log_path: pathlib.Path | None = None
         self._motion_log_file = None
@@ -184,8 +184,8 @@ class ENGELDataMission(Mission):
             filename = f"motion_log_{timestamp.strftime('%Y%m%d_%H%M%S')}.csv"
         return pathlib.Path(CAPTURE_DIR).joinpath(filename)
     
-    def get_arrive_flag(self):
-        return self.arrived_flag
+    # def get_arrive_flag(self):
+    #     return self.arrived_flag
 
     async def _open_motion_log(self, filename: str | None = None) -> None:
         self.motion_log_path = self._get_motion_log_path(filename)
@@ -718,12 +718,18 @@ class ENGELDataMission(Mission):
     def correction_callback(self, parsed_message):
         if parsed_message :
             try:
-                if self.target_flag == -1:
-                    self.arrived_flag = True
+                
+                # if self.target_flag == -1:
+                #     self.logger.info("Position correction target reached!")
+                #     self.arrived_flag = True
+                    
+                # else:
                 rotation = parsed_message["rotation"]  # roll pitch yaw in degrees per second
                 translation = parsed_message["translation"]  # x y z in cm / s
                 rotation_target = parsed_message["target"]
                 self.target_flag = parsed_message["target_flag"]
+                self.logger.info(f"Received message {parsed_message}")
+
                 # self.logger.info(parsed_message)
                 self.translation_shift = translation / 100
                 self.rotation_target = rotation_target
@@ -733,12 +739,15 @@ class ENGELDataMission(Mission):
                 # self._write_motion_log_entry()
 
                 # Do this here for testing
-                self.logger.info(f"Received message {parsed_message}")
-                _, pitch_rate, yaw_rate = self.rotation_shift
+                
+                _, pitch_rate, yaw_rate = rotation
                 gimbal_task = asyncio.run_coroutine_threadsafe(self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate), self._loop)
                 gimbal_awaiter_task = asyncio.run_coroutine_threadsafe(coroutine_awaiter(gimbal_task, self.logger), self._loop)
-                if self.rotation_target == "arrived":
+                if self.target_flag == -1:
                     self.logger.info("Position correction target reached!")
+                    self.refining = False
+                    self.stop_test()
+                    self.close_test()
             except Exception as e:
                 self.logger.warning("Exception forward position message! See log for details")
                 self.logger.debug(repr(e), exc_info=True)
@@ -757,6 +766,7 @@ class ENGELDataMission(Mission):
             except Exception as e:
                 self.logger.warning("Exception setting gimbal rates!")
                 self.logger.debug(repr(e), exc_info=True)
+
     async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
                         stream: str = "tcp://10.116.88.38:9000", unreal: int = 1, metod: str = "wsl", ssh_user: str ="user",
@@ -779,13 +789,38 @@ class ENGELDataMission(Mission):
             self.connect_simulation()
         self.logger.info("Setup for position correction test completed.")
 
+
+    async def destroy_test(self):
+        self.logger.info("Destroying position correction test...")
+
+        # Stop simulation if running
+        if hasattr(self, '_sim_running'):
+            self._sim_running = False
+        if hasattr(self, 'sim_task') and self.sim_task:
+            self.sim_task.cancel()
+            self.sim_task = None
+
+        # Close data UDP connection
+        if hasattr(self, 'transport') and self.transport:
+            self.transport.close()
+            self.transport = None
+            self.protocol = None
+
+        # Stop ImageMatcher subprocess
+        if self.correction_algo:
+            await self.correction_algo.stop_repositioning()  # cancel task + terminate proc
+            self.correction_algo = None
+
+        self.repositioning_task = None
+        self.logger.info("Position correction test destroyed.")
+
+
     def start_repositioning(self, ssh_ip: str|None, ssh_user: str|None, binary: str = "build/ImageMatcher", 
                                   target_image: str = "controls/imagesGT", unreal: int = 0, 
                                   stream: str = "tcp://10.116.88.38:9000", metod: str = "wsl",
                                   ):
         self.repositioning_task = asyncio.create_task(self.correction_algo.start_repositioning
-                                                      (
-                                                        target_image=target_image, binary_file=binary, 
+                                                      (target_image=target_image, binary_file=binary, 
                                                         unreal=unreal,stream=stream, method=metod, 
                                                         ssh_ip=ssh_ip, ssh_user=ssh_user,
                                                         ))
@@ -813,9 +848,13 @@ class ENGELDataMission(Mission):
             self.logger.debug(repr(e), exc_info=True)
 
     async def stop_test(self):
-        await self.correction_algo.stop()
+        await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
+        
         if self._motion_log_writer is not None:
             await self._close_motion_log()
+        if self.correction_algo is not None:
+            await self.correction_algo.stop()
+        await self.destroy_test()
         if self.repositioning_task:
             self.repositioning_task.cancel()
             try:
@@ -959,20 +998,22 @@ class PositionCorrectionHandler:
                     if self.command_handler.simulation:
                         # Clean the message (remove newlines and extra whitespace)
                         self.message_ = message.strip()
-                        self.logger.info(f"Got a message from the queue: {message}")
+                        # self.logger.info(f"Got a message from the queue: {message}")
                         if not self.start_receiving:
                             self.start_receiving = True
                             self.sim_task = asyncio.run_coroutine_threadsafe(self._handle_packet_sim(), self.loop)
                     elif self.message_callback is not None:
-                        self.logger.info(f"Got a message from the queue: {message}")
+                        # self.logger.info(f"Got a message from the queue: {message}")
                         data = self.command_handler.parse_motion_command(message)
                         self.loop.call_soon_threadsafe(self.message_callback, data)
-                if self.parent.arrived_flag:
-                    # self.loop.call_soon_threadsafe(self.close)
-                    self.close()
-                    
-                    #self.running = False
-                    
+                # if self.parent.arrived_flag:
+                #     # self.loop.call_soon_threadsafe(self.close)
+                #     self.logger.info(f"Arrived at target (arrived flag triggered), stopping correction algorithm...")
+                #     # self.stop()
+                #     close_task = asyncio.run_coroutine_threadsafe(self.parent.stop_test(), self.loop)
+                #     # self.loop.call_soon_threadsafe(self.parent.stop_test())
+                #     #self.running = False
+                   
             except Exception as e:
                 self.logger.warning(repr(e), exc_info=True)
         
@@ -1024,13 +1065,14 @@ class CommandChannel():
                 'rotation': np.zeros(3),
                 'translation': np.zeros(3),
                 'target': "gimbal",
-                'target_flag': True
+                'target_flag': 0
             }
         # self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     async def connect(self, ip: str = "127.0.0.1", port: int = 9020):
         try:
             self.ip = ip
             self.port = port
+            
             # self.sock.bind((ip, port))
             loop = asyncio.get_running_loop()
 
@@ -1145,8 +1187,6 @@ class CommandChannel():
             target = 'gimbal'
             if target_flag == 1:
                 target = 'drone'
-            elif target_flag == -1:
-                self.arrived_at_target = True
 
             result = {
                 'rotation': rotation,

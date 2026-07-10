@@ -61,3 +61,8 @@ logs/
 
 # MAVSDK server executable on windows
 src/dronemanager/mavsdk_server_bin.exe
+
+# Data files
+results/
+groundTruths/
+**.csv

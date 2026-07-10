@@ -61,7 +61,7 @@ def plot_comparison(motion_log_1, motion_log_2, output_file='comparison_plot_pos
     Uses motion_log_2's time axis for both datasets (motion_log_1 values are constant, so time doesn't matter).
     Extends constant ground truth values across the entire time duration.
     """
-    fig, axes = plt.subplots(3, 1, figsize=(21, 16))
+    fig, axes = plt.subplots(2, 1, figsize=(21, 16))
     fig.suptitle('Ground Truth (MotionLog 1) vs Unreal Engine Path (MotionLog 2)', fontsize=16, fontweight='bold')
     
     # Normalize time: start from 0 (reference from motion_log_2's first time)
@@ -128,12 +128,12 @@ def plot_comparison(motion_log_1, motion_log_2, output_file='comparison_plot_pos
     axes[1].legend(loc='best')
     axes[1].grid(True, alpha=0.3)
     
-    # Plot Rotation Z (Roll)
-    axes[2].plot(motion_log_2_time_normalized, gt_rel_roll, 'b-', label='MotionLog 1 (Ground Truth)', linewidth=2)
-    axes[2].plot(motion_log_2_time_normalized, motion_log_2['rel_roll'], 'r--', label='MotionLog 2 (UE Path)', linewidth=1.5, alpha=0.7)
-    axes[2].set_ylabel('Roll (degrees)', fontsize=10)
-    axes[2].legend(loc='best')
-    axes[2].grid(True, alpha=0.3)
+    # # Plot Rotation Z (Roll)
+    # axes[2].plot(motion_log_2_time_normalized, gt_rel_roll, 'b-', label='MotionLog 1 (Ground Truth)', linewidth=2)
+    # axes[2].plot(motion_log_2_time_normalized, motion_log_2['rel_roll'], 'r--', label='MotionLog 2 (UE Path)', linewidth=1.5, alpha=0.7)
+    # axes[2].set_ylabel('Roll (degrees)', fontsize=10)
+    # axes[2].legend(loc='best')
+    # axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
@@ -188,18 +188,20 @@ def main():
     print(f"🔍 Searching for log files in {repo_root}...")
     
     # Get MotionLog files (ground truth)
-    motion_logs = sorted(list(repo_root.glob('groundTruths/MotionLog_*.csv')))
+    motion_int = 1  # Specify the lab number for GT file
+    # Look for GT (ground truth) file
+    gt_int = 4
+    motion_logs = sorted(list(repo_root.glob(f'groundTruths/MotionLog_lab{gt_int}*.csv')))
     if not motion_logs:
         print("❌ No MotionLog files found in groundTruths/")
         return
-    
-    # Look for GT (ground truth) file
-    gt_logs = sorted(list(repo_root.glob('groundTruths/*GT*.csv')))
+
+    gt_logs = sorted(list(repo_root.glob(f'groundTruths/*GT_lab{gt_int}*.csv')))
     if gt_logs:
-        motion_log_1_path = gt_logs[-1]  # Use the GT file
+        motion_log_1_path = gt_logs[0]  # Use the GT file
         # Get other motion logs for comparison
         other_logs = sorted([f for f in motion_logs if 'GT' not in f.name])
-        motion_log_2_path = other_logs[-1] if other_logs else None
+        motion_log_2_path = other_logs[motion_int-1] if other_logs else None
         print(f"Loading ground truth (poses): {motion_log_1_path.name}")
         if motion_log_2_path:
             print(f"Loading Unreal Engine path (rates): {motion_log_2_path.name}")
@@ -216,7 +218,7 @@ def main():
             print(f"Loading Unreal Engine path (rates): {motion_log_2_path.name}")
     
     # Get AlgoLog (algorithm results)
-    algo_logs = list(repo_root.glob('logs/AlgoLog_*.csv'))
+    algo_logs = list(repo_root.glob(f'logs/AlgoLog_lab{motion_int}*.csv'))
     if not algo_logs:
         print("❌ No AlgoLog files found in build/")
         # return
