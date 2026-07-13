@@ -746,8 +746,8 @@ class ENGELDataMission(Mission):
                 if self.target_flag == -1:
                     self.logger.info("Position correction target reached!")
                     self.refining = False
-                    self.stop_test()
-                    self.close_test()
+                    asyncio.run_coroutine_threadsafe(self.stop_test(), self._loop)
+                    asyncio.run_coroutine_threadsafe(self.close_test(), self._loop)
             except Exception as e:
                 self.logger.warning("Exception forward position message! See log for details")
                 self.logger.debug(repr(e), exc_info=True)
@@ -808,7 +808,6 @@ class ENGELDataMission(Mission):
 
         # Stop ImageMatcher subprocess
         if self.correction_algo:
-            await self.correction_algo.stop_repositioning()  # cancel task + terminate proc
             self.correction_algo = None
 
         self.repositioning_task = None
@@ -848,7 +847,7 @@ class ENGELDataMission(Mission):
             self.logger.debug(repr(e), exc_info=True)
 
     async def stop_test(self):
-        await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
+        # await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
         
         if self._motion_log_writer is not None:
             await self._close_motion_log()
@@ -898,7 +897,7 @@ class PositionCorrectionHandler:
         self.remote_host = None # "10.116.88.38"
         self.message_ = None
         self.start_receiving = False
-        # self.image_file = ""
+        self.proc = None
         self.running = False
         self.command_handler = CommandChannel()
         self.message_callback = None
@@ -966,29 +965,37 @@ class PositionCorrectionHandler:
         else:
             self.logger.warning("Can't start repositioning system")
         # proc = subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL ) #capture_output=True,text=True) #
-        proc = await asyncio.create_subprocess_exec( *ssh_cmd,
+        self.proc = await asyncio.create_subprocess_exec( *ssh_cmd,
                                                     stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.PIPE,
                                                     stdin=asyncio.subprocess.DEVNULL  # stops it from grabbing terminal input
                                                     )
-        # self.logger.info(proc.stdout)
-        # self.logger.info(proc.stderr)
+        # self.logger.info(self.proc.stdout)
+        # self.logger.info(self.proc.stderr)
         # await asyncio.sleep(1)
+    
+    async def close_process(self):
+        if self.proc is not None:
+            self.proc.terminate()          # sends SIGTERM, graceful shutdown
+            try:
+                self.proc.wait(timeout=5)  # give it 5s to exit cleanly
+            except subprocess.TimeoutExpired:
+                self.proc.kill()           # SIGKILL if it didn't respond
+                self.proc.wait()           # reap the zombie
+            self.proc = None
+            self.logger.info("Correction algorithm process closed.")
 
     async def stop(self):
         self.logger.info("Closing correction algorithm...")
-        if self.command_handler.simulation:
-            self.command_handler.set_location_simulation()
-        else:
-            self.loop.call_soon_threadsafe(self.message_callback, self.command_handler.result_last)
-        self.logger.info("Stopping correction algorithm...")
-        self.command_handler.processing = False
         try:
             self.send_command("stop")
         except ConnectionAbortedError:
             self.logger.info("Couldn't send stop command: Connection aborted")
+        
+        self.command_handler.processing = False
         self.command_handler.close()
         self.close()
+        await self.close_process()
 
     def _data_thread(self):
         while self.running: # and not self.command_handler.arrived_at_target:

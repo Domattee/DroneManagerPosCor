@@ -188,9 +188,9 @@ def main():
     print(f"🔍 Searching for log files in {repo_root}...")
     
     # Get MotionLog files (ground truth)
-    motion_int = 1  # Specify the lab number for GT file
+    motion_int = 2  # Specify the lab number for GT file
     # Look for GT (ground truth) file
-    gt_int = 4
+    gt_int = 9
     motion_logs = sorted(list(repo_root.glob(f'groundTruths/MotionLog_lab{gt_int}*.csv')))
     if not motion_logs:
         print("❌ No MotionLog files found in groundTruths/")
