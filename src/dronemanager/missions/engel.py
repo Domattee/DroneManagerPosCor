@@ -769,19 +769,46 @@ class ENGELDataMission(Mission):
 
     async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
-                        stream: str = "tcp://10.116.88.38:9000", unreal: int = 1, mode: str = "live", metod: str = "ssh", ssh_user: str ="dronetrekkers",
+                        mode: str = "live", stream: str|None = "tcp://10.116.88.38:9000",
+                        metod: str = "ssh", ssh_user: str ="dronetrekkers",
                         imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
+                        copy_images: bool = False, target_images: str|None = "controls/imagesGT1",
                         ):
+        '''
+        Initializes the position correction test by setting up the necessary components 
+        and starting the repositioning task.
+        inputs:
+        ip: str - The IP address of the host machine running the position correction algorithm.
+        data_port: int - The port number for the host machine to send data to the drone.
+        binary: str - The path to the binary file for the position correction algorithm on the host machine.
+        target_image: str - The path to the target image on the host machine used for position correction.
+        simulation: int - A flag indicating whether the drone is running in simulation (1) or not (0).
+        mode: str - The mode of operation of the video feed, either "live" if running on device or "stream".
+        stream: str - The URL of the video stream to be used for position correction if mode is set to "stream".
+        metod: str - The method of connection to the host machine, either "ssh" or "wsl".
+        ssh_user: str - The username for SSH/WSL connection to the host machine.
+        imgHeight: int - The height of the image frames to be used for position correction.
+        imgWidth: int - The width of the image frames to be used for position correction.
+
+        '''
         
         if not ssh_user:
             ssh_user = None
 
         self.logger.info("Performing setup for position correction algorithm...")
-        self.correction_algo = PositionCorrectionHandler(parent=self)
+        self.correction_algo = PositionCorrectionHandler(parent=self, 
+                                                         remote_user=ssh_user, 
+                                                         remote_host=ip, 
+                                                         wsl_home_dir="/home/user/drone_repositioning", 
+                                                         binary=binary, 
+                                                         imgHeight=imgHeight, 
+                                                         imgWidth=imgWidth)
         self.correction_algo.message_callback = self.correction_callback
         self.repositioning_task = None
-        self.start_repositioning(ip, ssh_user, binary, target_image, unreal, stream, mode, metod)
-        # await self.connect_command(ip, command_port)
+        if copy_images and target_images:
+            await self.send_target_images(target_image=target_images)
+        self.start_repositioning(binary, target_image, simulation, stream, mode, metod, imgHeight, imgWidth)
+        
         await asyncio.sleep(2)  # Wait a bit for the command channel to be ready
         await self.connect_data(ip, data_port)
         simulation = bool(simulation)
@@ -789,9 +816,9 @@ class ENGELDataMission(Mission):
             self.connect_simulation()
         self.logger.info("Setup for position correction test completed.")
 
-    async def send_target_images(self, target_image: str = "controls/imagesGT1", ssh_ip: str = "127.0.0.1", ssh_user: str = "dronetrekkers"):
+    async def send_target_images(self, target_image: str = "controls/imagesGT1"):
         if self.correction_algo:
-            await self.correction_algo.send_target_images(target_image=target_image, ssh_ip=ssh_ip, ssh_user=ssh_user)
+            await self.correction_algo.send_target_images(target_image=target_image)
         else:
             self.logger.warning("Correction algorithm not initialized, cannot send target images.")
 
@@ -819,18 +846,15 @@ class ENGELDataMission(Mission):
         self.logger.info("Position correction test destroyed.")
 
 
-    def start_repositioning(self, ssh_ip: str|None = "192.168.0.10", ssh_user: str|None = "dronetrekkers", binary: str = "build/ImageMatcher", 
-                                  target_image: str = "controls/imagesGT", unreal: int = 0, 
-                                  stream: str = "tcp://10.116.88.38:9000", mode="live", metod: str = "ssh",
+    def start_repositioning(self, binary: str = "build/ImageMatcher",target_image: str = "controls/imagesGT", 
+                                  simulation: int = 0, stream: str|None = "tcp://10.116.88.38:9000", mode="live", 
+                                  metod: str = "ssh",imgHeight: int = 1080, imgWidth: int = 1920
                                   ):
         self.repositioning_task = asyncio.create_task(self.correction_algo.start_repositioning
                                                       (target_image=target_image, binary_file=binary, 
-                                                        unreal=unreal,stream=stream, mode=mode, method=metod,
+                                                        simulation=simulation,stream=stream, mode=mode, method=metod,
+                                                        imgHeight=imgHeight, imgWidth=imgWidth
                                                         ))
-
-        # self.correction_algo.start_repositioning(target_image=target_image, binary_file=binary, 
-        #                                                unreal=unreal,stream=stream, method=metod, 
-        #                                                ssh_ip=ssh_ip, ssh_user=ssh_user)
 
     def connect_simulation(self, ip: str = "10.116.88.38", port: int = 9001):
         self.correction_algo.connect_sim(ip, port)
@@ -934,6 +958,7 @@ class PositionCorrectionHandler:
         if self.remote_user is None or self.remote_host is None:
             self.logger.warning("SSH user or host not set, cannot send target images.")
             return
+        process = None
         try: 
             remote_path = f"{self.remote_user}@{self.remote_host}:{self.wsl_home_dir}" 
             process = await asyncio.create_subprocess_exec( "scp", "-r", target_image, 
@@ -948,6 +973,7 @@ class PositionCorrectionHandler:
         except Exception as e:
             self.logger.warning(f"Couldn't send target images due to an exception: {repr(e)}")
             self.logger.debug(repr(e), exc_info=True)
+
 
     async def _handle_packet_sim(self):
         try:
@@ -972,19 +998,19 @@ class PositionCorrectionHandler:
         self.handler_task = self.loop.run_in_executor(None, self._data_thread)
         self.send_command("start")
 
-    async def start_repositioning(self, target_image: str, binary_file: str, unreal:int, 
-                                  stream: str, mode: str, method:str):
+    async def start_repositioning(self, target_image: str, binary_file: str, simulation:int, 
+                                  stream: str, mode: str, method:str, imgHeight: int = 1080, imgWidth: int = 1920):
         # self.remote_user = ssh_user
         # self.remote_host = ssh_ip
         # self.image_file = target_image
         self.binary_path = f"{self.wsl_home_dir}/{binary_file}"
         self.wsl_target_image = f"{self.wsl_home_dir}/{target_image}"
-        tag = "0" if unreal == 0 else "1"
+        tag = "0" if simulation == 0 else "1"
         # stream = "tcp://10.116.88.38:9000"
         self.stream = stream
         remote_command = [self.binary_path, 
-                            "--imgWidth", "1920", 
-                            "--imgHeight", "1080", 
+                            "--imgWidth", str(imgWidth), 
+                            "--imgHeight", str(imgHeight), 
                             "--unreal", tag, 
                             "--target", self.wsl_target_image, 
                             "--rtsp", self.stream,
