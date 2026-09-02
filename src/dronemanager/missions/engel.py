@@ -130,7 +130,7 @@ class ENGELDataMission(Mission):
             "connect-data": self.connect_data,
             "test-start": self.start_test,
             "test-command": self.test_command,
-            "test-stop": self.stop_test,
+            "test-stop": self.stop_test_send,
             "test-close": self.close_test,
             "test-rates": self.rate_test,
             "test-log-start": self.open_motion_log,
@@ -747,7 +747,7 @@ class ENGELDataMission(Mission):
                     self.logger.info("Position correction target reached!")
                     self.refining = False
                     asyncio.run_coroutine_threadsafe(self.stop_test(), self._loop)
-                    asyncio.run_coroutine_threadsafe(self.close_test(), self._loop)
+                    # asyncio.run_coroutine_threadsafe(self.close_test(), self._loop)
             except Exception as e:
                 self.logger.warning("Exception forward position message! See log for details")
                 self.logger.debug(repr(e), exc_info=True)
@@ -769,7 +769,7 @@ class ENGELDataMission(Mission):
 
     async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
-                        stream: str = "tcp://10.116.88.38:9000", unreal: int = 1, metod: str = "wsl", ssh_user: str ="user",
+                        stream: str = "tcp://10.116.88.38:9000", unreal: int = 1, mode: str = "live", metod: str = "ssh", ssh_user: str ="dronetrekkers",
                         imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
                         ):
         
@@ -780,7 +780,7 @@ class ENGELDataMission(Mission):
         self.correction_algo = PositionCorrectionHandler(parent=self)
         self.correction_algo.message_callback = self.correction_callback
         self.repositioning_task = None
-        self.start_repositioning(ip, ssh_user, binary, target_image, unreal, stream, metod)
+        self.start_repositioning(ip, ssh_user, binary, target_image, unreal, stream, mode, metod)
         # await self.connect_command(ip, command_port)
         await asyncio.sleep(2)  # Wait a bit for the command channel to be ready
         await self.connect_data(ip, data_port)
@@ -789,6 +789,11 @@ class ENGELDataMission(Mission):
             self.connect_simulation()
         self.logger.info("Setup for position correction test completed.")
 
+    async def send_target_images(self, target_image: str = "controls/imagesGT1", ssh_ip: str = "127.0.0.1", ssh_user: str = "dronetrekkers"):
+        if self.correction_algo:
+            await self.correction_algo.send_target_images(target_image=target_image, ssh_ip=ssh_ip, ssh_user=ssh_user)
+        else:
+            self.logger.warning("Correction algorithm not initialized, cannot send target images.")
 
     async def destroy_test(self):
         self.logger.info("Destroying position correction test...")
@@ -814,14 +819,13 @@ class ENGELDataMission(Mission):
         self.logger.info("Position correction test destroyed.")
 
 
-    def start_repositioning(self, ssh_ip: str|None, ssh_user: str|None, binary: str = "build/ImageMatcher", 
+    def start_repositioning(self, ssh_ip: str|None = "192.168.0.10", ssh_user: str|None = "dronetrekkers", binary: str = "build/ImageMatcher", 
                                   target_image: str = "controls/imagesGT", unreal: int = 0, 
-                                  stream: str = "tcp://10.116.88.38:9000", metod: str = "wsl",
+                                  stream: str = "tcp://10.116.88.38:9000", mode="live", metod: str = "ssh",
                                   ):
         self.repositioning_task = asyncio.create_task(self.correction_algo.start_repositioning
                                                       (target_image=target_image, binary_file=binary, 
-                                                        unreal=unreal,stream=stream, method=metod, 
-                                                        ssh_ip=ssh_ip, ssh_user=ssh_user,
+                                                        unreal=unreal,stream=stream, mode=mode, method=metod,
                                                         ))
 
         # self.correction_algo.start_repositioning(target_image=target_image, binary_file=binary, 
@@ -846,8 +850,16 @@ class ENGELDataMission(Mission):
             self.logger.warning(f"Couldn't send command {cmd} due to an exception: {repr(e)}")
             self.logger.debug(repr(e), exc_info=True)
 
+    async def stop_test_send(self):
+        await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
+        
+        if self._motion_log_writer is not None:
+            await self._close_motion_log()
+        if self.correction_algo is not None:
+            await self.correction_algo.stop_send()
+
     async def stop_test(self):
-        # await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
+        await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
         
         if self._motion_log_writer is not None:
             await self._close_motion_log()
@@ -885,16 +897,16 @@ def _roll_pitch_compensation(gimbal_yaw, drone_roll, drone_pitch):
 
 
 class PositionCorrectionHandler:
-    def __init__(self, parent):
+    def __init__(self, parent, remote_user: str = "dronetrekkers", remote_host: str = "192.168.0.10", wsl_home_dir: str = "/home/user/drone_repositioning", binary_file: str = "build/ImageMatcher"):
         self.parent = parent
         # Initialise the channel classes
-        self.wsl_home_dir = "/home/user/drone_repositioning"
-        self.binary_file =  "build/ImageMatcher"
+        self.wsl_home_dir = wsl_home_dir
+        self.binary_file = binary_file
         # self.wsl_image_folder = ""
         self.binary_path = None
         self.wsl_target_image = None
-        self.remote_user = None # "riker"
-        self.remote_host = None # "10.116.88.38"
+        self.remote_user = remote_user # "riker"
+        self.remote_host = remote_host # "10.116.88.38"
         self.message_ = None
         self.start_receiving = False
         self.proc = None
@@ -917,6 +929,25 @@ class PositionCorrectionHandler:
 
     def connect_sim(self, ip: str = "127.0.0.1", port: int = 9020):
         self.command_handler.set_sim(ip=ip, port=port)
+
+    async def send_target_images(self, target_image: str = "controls/imagesGT1"):
+        if self.remote_user is None or self.remote_host is None:
+            self.logger.warning("SSH user or host not set, cannot send target images.")
+            return
+        try: 
+            remote_path = f"{self.remote_user}@{self.remote_host}:{self.wsl_home_dir}" 
+            process = await asyncio.create_subprocess_exec( "scp", "-r", target_image, 
+                                                           remote_path, stdout=asyncio.subprocess.PIPE, 
+                                                           stderr=asyncio.subprocess.PIPE, )
+            stdout, stderr = await process.communicate()
+            if process.returncode != 0: 
+                self.logger.warning( f"Couldn't send target images: {stderr.decode().strip()}" ) 
+                return
+            self.logger.info( f"Successfully sent target images from {target_image} to {remote_path}" )
+            
+        except Exception as e:
+            self.logger.warning(f"Couldn't send target images due to an exception: {repr(e)}")
+            self.logger.debug(repr(e), exc_info=True)
 
     async def _handle_packet_sim(self):
         try:
@@ -942,7 +973,7 @@ class PositionCorrectionHandler:
         self.send_command("start")
 
     async def start_repositioning(self, target_image: str, binary_file: str, unreal:int, 
-                                  stream: str, method:str, ssh_ip: str|None, ssh_user: str|None):
+                                  stream: str, mode: str, method:str):
         # self.remote_user = ssh_user
         # self.remote_host = ssh_ip
         # self.image_file = target_image
@@ -956,10 +987,12 @@ class PositionCorrectionHandler:
                             "--imgHeight", "1080", 
                             "--unreal", tag, 
                             "--target", self.wsl_target_image, 
-                            "--rtsp", self.stream
+                            "--rtsp", self.stream,
+                            "--mode", mode
                         ]
-        if method == "ssh" and ssh_ip is not None and ssh_user is not None:
-            ssh_cmd = ["ssh", f"{ssh_user}@{ssh_ip}"] + remote_command
+        if method == "ssh" and self.remote_host is not None and self.remote_user is not None:
+            shell_command = f"source {self.wsl_home_dir}/.venv/bin/activate && {remote_command}"
+            ssh_cmd = ["ssh", f"{self.remote_user}@{self.remote_host}"] + shell_command
         elif method == "wsl":
             ssh_cmd = ["wsl"] + remote_command
         else:
@@ -974,7 +1007,7 @@ class PositionCorrectionHandler:
         # self.logger.info(self.proc.stderr)
         # await asyncio.sleep(1)
     
-    async def close_process(self):
+    async def close_subprocess(self):
         if self.proc is not None:
             self.proc.terminate()          # sends SIGTERM, graceful shutdown
             try:
@@ -984,6 +1017,13 @@ class PositionCorrectionHandler:
                 self.proc.wait()           # reap the zombie
             self.proc = None
             self.logger.info("Correction algorithm process closed.")
+
+    async def stop_send(self):
+        self.logger.info("Closing correction algorithm...")
+        try:
+            self.send_command("stop")
+        except ConnectionAbortedError:
+            self.logger.info("Couldn't send stop command: Connection aborted")
 
     async def stop(self):
         self.logger.info("Closing correction algorithm...")
@@ -995,7 +1035,7 @@ class PositionCorrectionHandler:
         self.command_handler.processing = False
         self.command_handler.close()
         self.close()
-        await self.close_process()
+        await self.close_subprocess()
 
     def _data_thread(self):
         while self.running: # and not self.command_handler.arrived_at_target:
