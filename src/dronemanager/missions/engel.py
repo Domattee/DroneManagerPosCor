@@ -127,10 +127,11 @@ class ENGELDataMission(Mission):
             "done": self.done,
             "test-init": self.init_test,
             # "connect-command": self.connect_command,
-            "connect-data": self.connect_data,
+            # "connect-data": self.connect_data,
             "test-start": self.start_test,
             "test-command": self.test_command,
             "test-stop": self.stop_test_send,
+            "test-send-target-images": self.test_send_target_images,
             "test-close": self.close_test,
             "test-rates": self.rate_test,
             "test-log-start": self.open_motion_log,
@@ -168,7 +169,6 @@ class ENGELDataMission(Mission):
         # Position refinement stuff
         self.correction_algo: PositionCorrectionHandler | None = None
         self.refining = False
-        self.translation_shift = None
         self.rotation_shift = None
         self.rotation_target = None
         self.target_flag = 0
@@ -177,6 +177,8 @@ class ENGELDataMission(Mission):
         self.motion_log_path: pathlib.Path | None = None
         self._motion_log_file = None
         self._motion_log_writer = None
+
+        self._reference_yaw = 0.0
 
     def _get_motion_log_path(self, filename: str | None = None) -> pathlib.Path:
         if filename is None:
@@ -416,6 +418,7 @@ class ENGELDataMission(Mission):
                 if drone.is_armed and drone.in_air:
                     # Fly to position
                     # We only try to fly if we are armed an in the air. This is convenient for ground testing.
+                    self._reference_yaw = reference_image.drone_att[2]
                     await self.dm.fly_to(self.drone_name, gps=reference_image.gps, yaw=reference_image.drone_att[2])
 
                 # Wait until camera parameters are set
@@ -454,12 +457,7 @@ class ENGELDataMission(Mission):
                 # TODO: Process: While the other algorithm is running, grab updates from there and use whatever the
                 #  latest value is here
                 while self.refining:
-                    _, pitch_rate, yaw_rate = self.rotation_shift
-                    await self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate)
-                    #await self.dm.move(self.drone_name,
-                    #                   offset=self.translation_shift*drone.position_update_rate,
-                    #                   use_gps=False,
-                    #                   tolerance=0.05)
+                    await asyncio.sleep(0.1)
 
                 await self.do_capture(capture)
                 # TODO: Check for replays that didn't work
@@ -731,7 +729,8 @@ class ENGELDataMission(Mission):
                 self.logger.info(f"Received message {parsed_message}")
 
                 # self.logger.info(parsed_message)
-                self.translation_shift = translation / 100
+                translation_shift = translation / 100
+                translation_shift = np.clip(translation_shift, -1, 1)  # Limit translation shift to prevent too aggressive movement
                 self.rotation_target = rotation_target
                 self.rotation_shift = rotation
 
@@ -739,17 +738,25 @@ class ENGELDataMission(Mission):
                 # self._write_motion_log_entry()
 
                 # Do this here for testing
-                
                 _, pitch_rate, yaw_rate = rotation
                 gimbal_task = asyncio.run_coroutine_threadsafe(self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate), self._loop)
                 gimbal_awaiter_task = asyncio.run_coroutine_threadsafe(coroutine_awaiter(gimbal_task, self.logger), self._loop)
+
+                # Set velocity setpoint
+                drone_obj = self.dm.drones[self.drone_name]
+                target_vel_wp = Waypoint(WayPointType.VEL_NED, vel=translation_shift, yaw=self._reference_yaw)
+                asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(target_vel_wp), self._loop)
                 if self.target_flag == -1:
                     self.logger.info("Position correction target reached!")
                     self.refining = False
+                    # Drone setpoint for current position
+                    final_wp = Waypoint(WayPointType.POS_NED, pos=drone_obj.position_ned, yaw=self._reference_yaw)
+                    asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(final_wp), self._loop)
+                    # Stop correction
                     asyncio.run_coroutine_threadsafe(self.stop_test(), self._loop)
                     # asyncio.run_coroutine_threadsafe(self.close_test(), self._loop)
             except Exception as e:
-                self.logger.warning("Exception forward position message! See log for details")
+                self.logger.warning("Exception forwarding position correction messages! See log for details")
                 self.logger.debug(repr(e), exc_info=True)
 
     async def rate_test(self):
@@ -767,12 +774,32 @@ class ENGELDataMission(Mission):
                 self.logger.warning("Exception setting gimbal rates!")
                 self.logger.debug(repr(e), exc_info=True)
 
+    async def send_target_images(self, target_image: str = "controls/imagesGT1", remote_host: str = "192.168.0.10", 
+                                 remote_user: str = "dronetrekkers", home_dir: str = "/home/user/drone_repositioning"):
+            if remote_host is None or remote_user is None:
+                self.logger.warning("SSH user or host not set, cannot send target images.")
+                return
+            process = None
+            try: 
+                remote_path = f"{remote_user}@{remote_host}:{home_dir}" 
+                process = await asyncio.create_subprocess_exec( "scp", "-r", target_image, 
+                                                               remote_path, stdout=asyncio.subprocess.PIPE, 
+                                                               stderr=asyncio.subprocess.PIPE, )
+                stdout, stderr = await process.communicate()
+                if process.returncode != 0: 
+                    self.logger.warning( f"Couldn't send target images: {stderr.decode().strip()}" ) 
+                    return
+                self.logger.info( f"Successfully sent target images from {target_image} to {remote_path}" )
+                
+            except Exception as e:
+                self.logger.warning(f"Couldn't send target images due to an exception: {repr(e)}")
+                self.logger.debug(repr(e), exc_info=True)
+
     async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
                         mode: str = "live", stream: str|None = "tcp://10.116.88.38:9000",
                         metod: str = "ssh", ssh_user: str ="dronetrekkers",
                         imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
-                        copy_images: bool = False, target_images: str|None = "controls/imagesGT1",
                         ):
         '''
         Initializes the position correction test by setting up the necessary components 
@@ -805,8 +832,6 @@ class ENGELDataMission(Mission):
                                                          imgWidth=imgWidth)
         self.correction_algo.message_callback = self.correction_callback
         self.repositioning_task = None
-        if copy_images and target_images:
-            await self.send_target_images(target_image=target_images)
         self.start_repositioning(binary, target_image, simulation, stream, mode, metod, imgHeight, imgWidth)
         
         await asyncio.sleep(2)  # Wait a bit for the command channel to be ready
@@ -816,11 +841,13 @@ class ENGELDataMission(Mission):
             self.connect_simulation()
         self.logger.info("Setup for position correction test completed.")
 
-    async def send_target_images(self, target_image: str = "controls/imagesGT1"):
-        if self.correction_algo:
-            await self.correction_algo.send_target_images(target_image=target_image)
-        else:
-            self.logger.warning("Correction algorithm not initialized, cannot send target images.")
+    async def test_send_target_images(self, target_image: str = "controls/imagesGT1", remote_host: str = "192.168.0.10", 
+                                 remote_user: str = "dronetrekkers", home_dir: str = "/home/user/drone_repositioning"):
+        try:
+            await self.send_target_images(target_image=target_image, remote_host=remote_host, remote_user=remote_user, home_dir=home_dir)
+            self.logger.info("Target images sent successfully.")
+        except Exception as e:
+            self.logger.error(f"Error occurred while sending target images: {repr(e)}")
 
     async def destroy_test(self):
         self.logger.info("Destroying position correction test...")
@@ -883,7 +910,7 @@ class ENGELDataMission(Mission):
             await self.correction_algo.stop_send()
 
     async def stop_test(self):
-        await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw) 
+        await self.gimbal.set_gimbal_angles(self.gimbal.pitch, self.gimbal.yaw)
         
         if self._motion_log_writer is not None:
             await self._close_motion_log()
@@ -953,27 +980,6 @@ class PositionCorrectionHandler:
 
     def connect_sim(self, ip: str = "127.0.0.1", port: int = 9020):
         self.command_handler.set_sim(ip=ip, port=port)
-
-    async def send_target_images(self, target_image: str = "controls/imagesGT1"):
-        if self.remote_user is None or self.remote_host is None:
-            self.logger.warning("SSH user or host not set, cannot send target images.")
-            return
-        process = None
-        try: 
-            remote_path = f"{self.remote_user}@{self.remote_host}:{self.wsl_home_dir}" 
-            process = await asyncio.create_subprocess_exec( "scp", "-r", target_image, 
-                                                           remote_path, stdout=asyncio.subprocess.PIPE, 
-                                                           stderr=asyncio.subprocess.PIPE, )
-            stdout, stderr = await process.communicate()
-            if process.returncode != 0: 
-                self.logger.warning( f"Couldn't send target images: {stderr.decode().strip()}" ) 
-                return
-            self.logger.info( f"Successfully sent target images from {target_image} to {remote_path}" )
-            
-        except Exception as e:
-            self.logger.warning(f"Couldn't send target images due to an exception: {repr(e)}")
-            self.logger.debug(repr(e), exc_info=True)
-
 
     async def _handle_packet_sim(self):
         try:
