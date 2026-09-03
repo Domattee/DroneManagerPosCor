@@ -416,7 +416,7 @@ class ENGELDataMission(Mission):
                 # Fly to position and point gimbal
                 # Have to reset gimbal position to drone-relative 0 to prevent running into gimbal limit
                 await self.gimbal.set_gimbal_mode("follow")
-                await self.gimbal.set_gimbal_angles(0.0, 0.0)
+                await self.gimbal.set_gimbal_angles(0.1, 0.1)
                 if drone.is_armed and drone.in_air:
                     # Fly to position
                     # We only try to fly if we are armed an in the air. This is convenient for ground testing.
@@ -443,6 +443,7 @@ class ENGELDataMission(Mission):
 
                 await self.gimbal.set_gimbal_mode("lock")
                 await self.gimbal.set_gimbal_angles(target_gimbal_pitch, target_gimbal_yaw)
+                await asyncio.sleep(0.1)
                 await asyncio.sleep(3)
                 # Fine gimbal adjustment
                 while (abs(self.gimbal.pitch - target_gimbal_pitch) > 0.25
@@ -458,8 +459,9 @@ class ENGELDataMission(Mission):
                 # TODO: Process: While the other algorithm is running, grab updates from there and use whatever the
                 #  latest value is here
                 while self.refining:
-                    _, pitch_rate, yaw_rate = self.rotation_shift
-                    await self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate)
+                    await asyncio.sleep(0.1)
+                    #_, pitch_rate, yaw_rate = self.rotation_shift
+                    #await self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate)
                     #await self.dm.move(self.drone_name,
                     #                   offset=self.translation_shift*drone.position_update_rate,
                     #                   use_gps=False,
@@ -470,7 +472,7 @@ class ENGELDataMission(Mission):
 
                 # Reset gimbal
                 await self.gimbal.set_gimbal_mode("follow")
-                await self.gimbal.set_gimbal_angles(0.0, 0.0)
+                await self.gimbal.set_gimbal_angles(0.1, 0.1)
             except Exception as e:
                 self.logger.warning(f"Exception with replay for capture {capture.capture_id}")
                 self.logger.debug(repr(e), exc_info=True)
@@ -921,7 +923,7 @@ class ENGELDataMission(Mission):
         await self._close_motion_log()
 
 def _roll_pitch_compensation(gimbal_yaw, drone_roll, drone_pitch):
-    return math.sin(gimbal_yaw)*drone_roll + math.cos(gimbal_yaw) * drone_pitch
+    return 0
 
 
 class PositionCorrectionHandler:
