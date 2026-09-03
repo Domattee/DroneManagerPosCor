@@ -390,15 +390,19 @@ class ENGELDataMission(Mission):
             if self.camera.parameters[name].value != value:
                 await self.camera.set_parameter(name, value)
 
-    async def replay_captures(self):
-        await self.drones[self.drone_name].execute_task(self._replay_captures())
+    async def replay_captures(self, idx: int | None = None):
+        await self.drones[self.drone_name].execute_task(self._replay_captures(idx=idx))
 
-    async def _replay_captures(self):
+    async def _replay_captures(self, idx: int | None):
         """ Function to take the position from previous captures saved to file and capture them all again."""
         # For each loaded capture: Set camera parameters, fly to position, optionally refine position, take new capture
         # Currently just prints loaded info for debug purposes
+        if idx is None:
+            captures = self.loaded_captures
+        else:
+            captures = [self.loaded_captures[idx]]
         drone = self.drones[self.drone_name]
-        for capture in self.loaded_captures:
+        for capture in captures:
             try:
                 reference_image = capture.images[0]
                 # Use "visible" as reference image for now. TODO: Figure out if this is best, might have to do screenshots if comparison happens against live feed
