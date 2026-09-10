@@ -803,7 +803,7 @@ class ENGELDataMission(Mission):
     async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
                         mode: str = "live", stream: str|None = "tcp://10.116.88.38:9000",
-                        metod: str = "ssh", ssh_user: str ="dronetrekkers",
+                        metod: str = "ssh", ssh_user: str ="dronetrekkers", ssh_password: str|None = None,
                         imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
                         ):
         '''
@@ -831,6 +831,7 @@ class ENGELDataMission(Mission):
         self.correction_algo = PositionCorrectionHandler(parent=self, 
                                                          remote_user=ssh_user, 
                                                          remote_host=ip, 
+                                                         remote_password=ssh_password,
                                                          wsl_home_dir="/home/user/drone_repositioning", 
                                                          binary=binary, 
                                                          imgHeight=imgHeight, 
@@ -953,7 +954,7 @@ def _roll_pitch_compensation(gimbal_yaw, drone_roll, drone_pitch):
 
 
 class PositionCorrectionHandler:
-    def __init__(self, parent, remote_user: str = "dronetrekkers", remote_host: str = "192.168.0.10", wsl_home_dir: str = "/home/user/drone_repositioning", binary_file: str = "build/ImageMatcher"):
+    def __init__(self, parent, remote_user: str = "dronetrekkers", remote_host: str = "192.168.0.10", remote_password: str|None = None, wsl_home_dir: str = "/home/user/drone_repositioning", binary_file: str = "build/ImageMatcher"):
         self.parent = parent
         # Initialise the channel classes
         self.wsl_home_dir = wsl_home_dir
@@ -963,6 +964,7 @@ class PositionCorrectionHandler:
         self.wsl_target_image = None
         self.remote_user = remote_user # "riker"
         self.remote_host = remote_host # "10.116.88.38"
+        self.remote_password = remote_password # "password"
         self.message_ = None
         self.start_receiving = False
         self.proc = None
@@ -1027,9 +1029,9 @@ class PositionCorrectionHandler:
                             "--rtsp", self.stream,
                             "--mode", mode
                         ]
-        if method == "ssh" and self.remote_host is not None and self.remote_user is not None:
+        if method == "ssh" and self.remote_host is not None and self.remote_user is not None and self.remote_password is not None:
             shell_command = f"source {self.wsl_home_dir}/.venv/bin/activate && {remote_command}"
-            ssh_cmd = ["ssh", f"{self.remote_user}@{self.remote_host}"] + shell_command
+            ssh_cmd = ["sshpass", "-p", self.remote_password, "ssh", f"{self.remote_user}@{self.remote_host}"] + shell_command
         elif method == "wsl":
             ssh_cmd = ["wsl"] + remote_command
         else:
