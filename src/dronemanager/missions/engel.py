@@ -416,9 +416,10 @@ class ENGELDataMission(Mission):
 
                 # Set camera parameters
                 cam_set_task = asyncio.create_task(self.set_camera_parameters(capture.camera_parameters))
-                self.running_tasks.add(cam_set_task)
+                self._running_tasks.add(cam_set_task)
                 # Fly to position and point gimbal
                 # Have to reset gimbal position to drone-relative 0 to prevent running into gimbal limit
+                self.logger.debug("Resetting gimbal position to neutral.")
                 await self.gimbal.set_gimbal_mode("follow")
                 res = False
                 while not res:
@@ -430,6 +431,7 @@ class ENGELDataMission(Mission):
                     await self.dm.fly_to(self.drone_name, gps=reference_image.gps, yaw=reference_image.drone_att[2])
 
                 # Move gimbal to the relative angle, should match absolute pretty close
+                self.logger.debug("Moving gimbal to approximate target position.")
                 await self.gimbal.set_gimbal_mode("follow")
                 res = False
                 while not res:
@@ -441,10 +443,6 @@ class ENGELDataMission(Mission):
                 # Point gimbal
                 target_gimbal_pitch = reference_image.gimbal_att[1]
                 target_gimbal_yaw = reference_image.gimbal_yaw_absolute
-
-                if self._gimbal_max_pitch < target_gimbal_pitch < self._gimbal_min_pitch:
-                    self.logger.info("Replay exceeding gimbal limit, skipping...")
-                    continue
 
                 await self.gimbal.set_gimbal_mode("lock")
                 res = False
