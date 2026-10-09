@@ -156,6 +156,11 @@ class ENGELDataMission(Mission):
         self.loaded_file: str | None = None
         self._current_capture: ENGELCaptureInfo | None = None
 
+        # Due to drone motion, we might have to move beyond gimbal limits during replay, leading to a deadlock. These
+        # limits prevent this, by skipping any captures where the gimbal pitch would exceed these values.
+        self._gimbal_max_pitch = 40
+        self._gimbal_min_pitch = -44
+
         # Controller stuff
         self._added_controller_buttons: dict[int, Callable] = {}
         self._added_controller_axis_methods: set[Callable] = set()
@@ -435,20 +440,19 @@ class ENGELDataMission(Mission):
                 await self.gimbal.set_gimbal_mode("follow")
                 res = False
                 while not res:
-                    res = await self.gimbal.set_gimbal_angles(reference_image.gimbal_att[1], reference_image.gimbal_att[
-                        2])  # Set a non-zero to make sure gimbal responds
-                await asyncio.sleep(1.5)  # Short sleep so gimbal has time to physically move.
+                    res = await self.gimbal.set_gimbal_angles(reference_image.gimbal_att[1], reference_image.gimbal_att[2])  # Set a non-zero to make sure gimbal responds
+                # Wait for gimbal to have reached position.
+                while abs(self.gimbal.pitch - reference_image.gimbal_att[1]) > 1 or abs(self.gimbal.yaw - reference_image.gimbal_att[2]) > 1:
+                    await asyncio.sleep(0.1)
                 # Wait until camera parameters are set
                 await cam_set_task
-                # Point gimbal
+
                 target_gimbal_pitch = reference_image.gimbal_att[1]
                 target_gimbal_yaw = reference_image.gimbal_yaw_absolute
+                if self._gimbal_max_pitch < target_gimbal_pitch < self._gimbal_min_pitch:
+                    self.logger.info("Replay exceeding gimbal limit, skipping...")
+                    continue
 
-                await self.gimbal.set_gimbal_mode("lock")
-                res = False
-                while not res:
-                    res = await self.gimbal.set_gimbal_angles(target_gimbal_pitch, target_gimbal_yaw)
-                await asyncio.sleep(3)
                 # Refine position and gimbal attitude based on previous image
                 self.logger.info("Reached coarse position, handing over to refining Algo.")
                 while self.refining:
