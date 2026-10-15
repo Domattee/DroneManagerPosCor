@@ -19,6 +19,9 @@ import datetime
 import time
 import os
 import shutil
+import shlex
+
+import paramiko
 
 from dronemanager.navigation.core import Waypoint, WayPointType
 from dronemanager.plugins.mission import Mission
@@ -794,7 +797,7 @@ class ENGELDataMission(Mission):
     async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
                         mode: str = "live", stream: str|None = "tcp://10.116.88.38:9000",
-                        metod: str = "ssh", ssh_user: str ="dronetrekkers", ssh_password: str|None = None,
+                        method: str = "ssh", ssh_user: str ="dronetrekkers", ssh_password: str|None = None,
                         imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
                         ):
         '''
@@ -814,22 +817,22 @@ class ENGELDataMission(Mission):
         imgWidth: int - The width of the image frames to be used for position correction.
 
         '''
-        
+        home_dir="/home/user/drone_repositioning"
         if not ssh_user:
             ssh_user = None
+        else :
+            home_dir="/home/dronetrekkers/drone_repositioning"
 
-        self.logger.info("Performing setup for position correction algorithm...")
+        self.logger.info(f"Performing setup for position correction algorithm on {home_dir}")
         self.correction_algo = PositionCorrectionHandler(parent=self, 
                                                          remote_user=ssh_user, 
                                                          remote_host=ip, 
                                                          remote_password=ssh_password,
-                                                         wsl_home_dir="/home/user/drone_repositioning", 
-                                                         binary=binary, 
-                                                         imgHeight=imgHeight, 
-                                                         imgWidth=imgWidth)
+                                                         wsl_home_dir=home_dir, 
+                                                         binary_file=binary)
         self.correction_algo.message_callback = self.correction_callback
         self.repositioning_task = None
-        self.start_repositioning(binary, target_image, simulation, stream, mode, metod, imgHeight, imgWidth)
+        self.start_repositioning(binary, target_image, simulation, stream, mode, method, imgHeight, imgWidth)
         
         await asyncio.sleep(2)  # Wait a bit for the command channel to be ready
         await self.connect_data(ip, data_port)
@@ -872,13 +875,22 @@ class ENGELDataMission(Mission):
 
     def start_repositioning(self, binary: str = "build/ImageMatcher",target_image: str = "controls/imagesGT", 
                                   simulation: int = 0, stream: str|None = "tcp://10.116.88.38:9000", mode="live", 
-                                  metod: str = "ssh",imgHeight: int = 1080, imgWidth: int = 1920
+                                  method: str = "ssh",imgHeight: int = 1080, imgWidth: int = 1920
                                   ):
         self.repositioning_task = asyncio.create_task(self.correction_algo.start_repositioning
                                                       (target_image=target_image, binary_file=binary, 
-                                                        simulation=simulation,stream=stream, mode=mode, method=metod,
+                                                        simulation=simulation,stream=stream, mode=mode, method=method,
                                                         imgHeight=imgHeight, imgWidth=imgWidth
                                                         ))
+        self.repositioning_task.add_done_callback(self._repositioning_task_done)
+
+    def _repositioning_task_done(self, task: asyncio.Task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.logger.error(f"Failed to launch repositioning process: {repr(exc)}")
+            self.logger.debug(repr(exc), exc_info=exc)
 
     def connect_simulation(self, ip: str = "10.116.88.38", port: int = 9001):
         self.correction_algo.connect_sim(ip, port)
@@ -1009,6 +1021,8 @@ class PositionCorrectionHandler:
         # self.image_file = target_image
         self.binary_path = f"{self.wsl_home_dir}/{binary_file}"
         self.wsl_target_image = f"{self.wsl_home_dir}/{target_image}"
+        self.logger.info(f"Binary path: {self.binary_path}")
+        self.logger.info(f"target image: {self.wsl_target_image}")
         tag = "0" if simulation == 0 else "1"
         # stream = "tcp://10.116.88.38:9000"
         self.stream = stream
@@ -1020,33 +1034,61 @@ class PositionCorrectionHandler:
                             "--rtsp", self.stream,
                             "--mode", mode
                         ]
-        if method == "ssh" and self.remote_host is not None and self.remote_user is not None and self.remote_password is not None:
-            shell_command = f"source {self.wsl_home_dir}/.venv/bin/activate && {remote_command}"
-            ssh_cmd = ["sshpass", "-p", self.remote_password, "ssh", f"{self.remote_user}@{self.remote_host}"] + shell_command
-        elif method == "wsl":
-            ssh_cmd = ["wsl"] + remote_command
-        else:
-            self.logger.warning("Can't start repositioning system")
+        self.logger.info(f"{method}, {self.remote_host}, {self.remote_user}, {self.remote_password}")
+        if self.remote_host is None or self.remote_user is None or self.remote_password is None:
+            self.logger.warning("Can't start repositioning system: SSH host, user or password not set")
+            return
+        command = f"""
+        cd {shlex.quote(self.wsl_home_dir)} &&
+        source {self.wsl_home_dir}/.venv/bin/activate &&
+        echo $$ &&
+        exec {shlex.join(remote_command)}
+        """
+        self.ssh_client = paramiko.SSHClient()
+        self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        self.ssh_client.connect(
+            hostname=self.remote_host,
+            username=self.remote_user,
+            password=self.remote_password,
+        )
+
+        stdin, stdout, stderr = self.ssh_client.exec_command(command)
+
+        self.pid = int(stdout.readline().strip())
+        self.logger.info(f"Started remote ImageMatcher with PID {self.pid}")
+        # shell_command = f"source {self.wsl_home_dir}/.venv/bin/activate && {shlex.join(remote_command)}"
+        # self.logger.info(f"Started command: {shell_command}")
+        # ssh_cmd = ["sshpass", "-p", self.remote_password, "ssh", f"{self.remote_user}@{self.remote_host}", shell_command]
+        # self.logger.info(f"Started command1")
+        # # if method == "wsl":
+        # #     ssh_cmd = ["wsl"] + remote_command
+        # # else:
+        # #     self.logger.warning("Can't start repositioning system")
+        # self.logger.info(f"{method}")
         # proc = subprocess.Popen(ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL ) #capture_output=True,text=True) #
-        self.proc = await asyncio.create_subprocess_exec( *ssh_cmd,
-                                                    stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.PIPE,
-                                                    stdin=asyncio.subprocess.DEVNULL  # stops it from grabbing terminal input
-                                                    )
+        # self.proc = await asyncio.create_subprocess_exec( *ssh_cmd,
+        #                                             stdout=asyncio.subprocess.PIPE,
+        #                                             stderr=asyncio.subprocess.PIPE,
+        #                                             stdin=asyncio.subprocess.DEVNULL  # stops it from grabbing terminal input
+        #                                             )
         # self.logger.info(self.proc.stdout)
         # self.logger.info(self.proc.stderr)
-        # await asyncio.sleep(1)
+        await asyncio.sleep(1)
     
     async def close_subprocess(self):
         if self.proc is not None:
             self.proc.terminate()          # sends SIGTERM, graceful shutdown
             try:
-                self.proc.wait(timeout=5)  # give it 5s to exit cleanly
-            except subprocess.TimeoutExpired:
+                await asyncio.wait_for(self.proc.wait(), 5)  # give it 5s to exit cleanly
+            except asyncio.TimeoutError:
                 self.proc.kill()           # SIGKILL if it didn't respond
-                self.proc.wait()           # reap the zombie
+                await self.proc.wait()     # reap the zombie
             self.proc = None
             self.logger.info("Correction algorithm process closed.")
+        else:
+            await asyncio.sleep(1)
+            self.ssh_client.exec_command(f"kill -TERM {self.pid}")
 
     async def stop_send(self):
         self.logger.info("Closing correction algorithm...")
